@@ -13,8 +13,25 @@ import {
   type ComputerHistoryPermission,
   type ComputerHistoryPermissions,
 } from "./computer-history-contract.js";
+import {
+  CuHistoryAssetSchema,
+  CuHistoryEventDetailSchema,
+  CuHistoryPageSchema,
+  type CuHistoryAsset,
+  type CuHistoryEventDetail,
+  type CuHistoryListOptions,
+  type CuHistoryPage,
+} from "./cu-history-contract.js";
 
 export { ComputerHistorySnapshotSchema };
+export type {
+  CuHistoryAsset,
+  CuHistoryEvent,
+  CuHistoryEventDetail,
+  CuHistoryKind,
+  CuHistoryListOptions,
+  CuHistoryPage,
+} from "./cu-history-contract.js";
 
 export type AgentGoalStatus =
   | "active"
@@ -709,6 +726,9 @@ export interface MemmyAgentClient {
   bootstrap(options?: { force?: boolean }): Promise<MemmyAgentBootstrap>;
   getSettings(): Promise<MemmyAgentSettings>;
   getComputerHistory(): Promise<ComputerHistorySnapshot>;
+  listCuHistoryEvents(options?: CuHistoryListOptions): Promise<CuHistoryPage>;
+  getCuHistoryEvent(eventId: string, options?: MemmyAgentRequestOptions): Promise<CuHistoryEventDetail>;
+  getCuHistoryAsset(assetId: string, options?: MemmyAgentRequestOptions): Promise<CuHistoryAsset>;
   setComputerHistoryModel(preset: string | null): Promise<ComputerHistorySnapshot>;
   checkComputerHistoryPermissions(): Promise<ComputerHistoryPermissions>;
   openComputerHistoryPermission(permission: ComputerHistoryPermission, mode?: "request" | "settings"): Promise<ComputerHistoryPermissions>;
@@ -1071,6 +1091,36 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
     return this.request("/api/computer-history", ComputerHistorySnapshotSchema);
   }
 
+  async listCuHistoryEvents(options: CuHistoryListOptions = {}): Promise<CuHistoryPage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.from) query.set("from", options.from);
+    if (options.to) query.set("to", options.to);
+    if (options.kind) query.set("kind", options.kind);
+    if (options.sessionId) query.set("session_id", options.sessionId);
+    if (options.turnId) query.set("turn_id", options.turnId);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return this.request(`/api/cu-history/events${suffix}`, CuHistoryPageSchema, {
+      signal: options.signal,
+      normalizeMediaUrls: false,
+    });
+  }
+
+  async getCuHistoryEvent(eventId: string, options: MemmyAgentRequestOptions = {}): Promise<CuHistoryEventDetail> {
+    return this.request(`/api/cu-history/events/${encodeURIComponent(eventId)}`, CuHistoryEventDetailSchema, {
+      ...options,
+      normalizeMediaUrls: false,
+    });
+  }
+
+  async getCuHistoryAsset(assetId: string, options: MemmyAgentRequestOptions = {}): Promise<CuHistoryAsset> {
+    return this.request(`/api/cu-history/assets/${encodeURIComponent(assetId)}`, CuHistoryAssetSchema, {
+      ...options,
+      normalizeMediaUrls: false,
+    });
+  }
+
   async deleteComputerHistory(historyId: string): Promise<ComputerHistorySnapshot> {
     return this.request("/api/computer-history/delete", ComputerHistorySnapshotSchema, {
       method: "POST",
@@ -1385,6 +1435,7 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
       method?: string;
       body?: unknown;
       retryOnUnauthorized?: boolean;
+      normalizeMediaUrls?: boolean;
       signal?: AbortSignal;
       timeoutMs?: number;
     } = {}
@@ -1426,7 +1477,7 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
       }
 
       const parsed = schema.parse(await response.json());
-      return normalizeGatewayMediaUrls(parsed, this.baseUrl);
+      return options.normalizeMediaUrls === false ? parsed : normalizeGatewayMediaUrls(parsed, this.baseUrl);
     } finally {
       if (timeout) clearTimeout(timeout);
     }

@@ -174,6 +174,7 @@ export class AgentRunSpec {
   onMaxFinalizationStarting?: (() => void) | null;
   currentTurnMessageStartIndex?: number | null;
   beforeFollowupModelRequest?: ((ctx: FollowupModelRequestContext) => Promise<FollowupModelContextUpdate>) | null;
+  computerUseHistory?: ToolExecutionContext["computerUseHistory"];
 
   constructor(init: {
     messages?: Record<string, any>[];
@@ -213,6 +214,7 @@ export class AgentRunSpec {
     onMaxFinalizationStarting?: (() => void) | null;
     currentTurnMessageStartIndex?: number | null;
     beforeFollowupModelRequest?: ((ctx: FollowupModelRequestContext) => Promise<FollowupModelContextUpdate>) | null;
+    computerUseHistory?: ToolExecutionContext["computerUseHistory"];
   } = {}) {
     this.messages = this.initialMessages = init.messages ?? init.initialMessages ?? [];
     this.provider = init.provider;
@@ -250,6 +252,7 @@ export class AgentRunSpec {
     this.onMaxFinalizationStarting = init.onMaxFinalizationStarting ?? null;
     this.currentTurnMessageStartIndex = init.currentTurnMessageStartIndex ?? null;
     this.beforeFollowupModelRequest = init.beforeFollowupModelRequest ?? null;
+    this.computerUseHistory = init.computerUseHistory ? Object.freeze({ ...init.computerUseHistory }) : null;
   }
 }
 
@@ -1101,6 +1104,7 @@ export class AgentRunner {
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
         callId: call.id ?? null,
+        computerUseHistory: spec.computerUseHistory,
         stopTurn: (message) => { stopTurn ??= message; },
         reportFileMutation: (outcome) => {
           fileMutationOutcomes.set(path.resolve(outcome.path), {

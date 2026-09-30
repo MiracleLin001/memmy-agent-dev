@@ -2562,7 +2562,7 @@ export class AgentLoop {
       role: "user",
       content: this.context.buildUserContent(content, media),
       ...(clientRequestId
-        ? { client_request_id: clientRequestId }
+        ? { client_request_id: clientRequestId, cu_history_prompt_timestamp: msg.timestamp.toISOString() }
         : {}),
       ...(queueSteerOrigin && typeof msg.metadata?.webui_request_digest === "string"
         ? { webui_request_digest: msg.metadata.webui_request_digest }
@@ -3473,6 +3473,8 @@ export class AgentLoop {
       chatId = null,
       messageId = null,
       metadata = {},
+      historyPrompt = null,
+      historyPromptTimestamp = null,
       sessionKey = null,
       pendingQueue = null,
       abortSignal = null,
@@ -3497,6 +3499,8 @@ export class AgentLoop {
       chatId?: string | null;
       messageId?: string | null;
       metadata?: Record<string, any>;
+      historyPrompt?: string | null;
+      historyPromptTimestamp?: string | null;
       sessionKey?: string | null;
       pendingQueue?: AsyncQueue<InboundMessage> | null;
       abortSignal?: AbortSignal | null;
@@ -3544,8 +3548,8 @@ export class AgentLoop {
       },
     });
     const hook = this.extraHooks.length ? new CompositeAgentHook([loopHook, ...this.extraHooks]) : loopHook;
-    const result = await this.runner.run(
-      new AgentRunSpec({
+    let runSpec!: AgentRunSpec;
+    runSpec = new AgentRunSpec({
         messages: initialMessages,
         provider: activeProvider,
         tools: activeTools,
@@ -3571,11 +3575,43 @@ export class AgentLoop {
           metadata: session?.metadata ?? null,
         }),
         turnId,
+        computerUseHistory: {
+          sessionId: activeSessionKey,
+          turnId,
+          messageId,
+          channel,
+          chatId,
+          promptText: internalTurnContext ? null : historyPrompt,
+          promptTimestamp: internalTurnContext ? null : historyPromptTimestamp,
+        },
         boundary,
         abortSignal,
         hook,
         concurrentTools: true,
-        injectionCallback: ({ limit = 3 } = {}) => this.drainPendingQueue(pendingQueue, limit, session?.key ?? sessionKey),
+        injectionCallback: async ({ limit = 3 } = {}) => {
+          const injections = await this.drainPendingQueue(pendingQueue, limit, session?.key ?? sessionKey);
+          const latestSteer = injections.filter((item) => item.role === "user"
+            && typeof item.client_request_id === "string").at(-1);
+          if (latestSteer && runSpec.computerUseHistory) {
+            const content = latestSteer.content;
+            const promptText = typeof content === "string" ? content
+              : Array.isArray(content) ? content
+                .filter((block) => block?.type === "text" && typeof block.text === "string")
+                .map((block) => block.text).join("\n") : null;
+            // Only this run's context pointer changes. Each snapshot passed to
+            // a tool remains frozen, so shared MCP wrappers cannot mix chats.
+            runSpec.computerUseHistory = Object.freeze({
+              ...runSpec.computerUseHistory,
+              turnId: typeof latestSteer.turn_id === "string"
+                ? latestSteer.turn_id : runSpec.computerUseHistory.turnId,
+              messageId: latestSteer.client_request_id,
+              promptText: typeof promptText === "string" && promptText.trim() ? promptText : null,
+              promptTimestamp: typeof latestSteer.cu_history_prompt_timestamp === "string"
+                ? latestSteer.cu_history_prompt_timestamp : null,
+            });
+          }
+          return injections;
+        },
         internalTurnContext,
         actualModelContext: modelSelection ? persistedModelSelection(modelSelection) : null,
         onMaxFinalizationStarting,
@@ -3589,8 +3625,8 @@ export class AgentLoop {
               onTokenCompactionEvent,
             )
           : null,
-      }),
-    );
+    });
+    const result = await this.runner.run(runSpec);
     const rawUsage = result.usage ?? result.response?.usage;
     const usage = normalizeUsageRecord(rawUsage);
     if (activeSessionKey) {
@@ -4064,6 +4100,8 @@ export class AgentLoop {
       chatId: ctx.msg.chatId,
       messageId: ctx.msg.metadata?.message_id ?? ctx.msg.metadata?.messageId,
       metadata: { ...ctx.msg.metadata, ...(ctx.msg.internal ? { computerUseInteractive: false } : {}) },
+      historyPrompt: ctx.msg.internal ? null : ctx.msg.content,
+      historyPromptTimestamp: ctx.msg.timestamp.toISOString(),
       sessionKey: ctx.sessionKey,
       pendingQueue: ctx.pendingQueue,
       abortSignal: ctx.abortSignal,
@@ -4427,6 +4465,7 @@ export class AgentLoop {
       }),
     );
 
+    const effectiveTurnId = turnId ?? firstString(msg.metadata?.turn_id, msg.metadata?.turnId) ?? cryptoRandomId();
     const started = Date.now();
     const [
       rawFinalContent,
@@ -4450,7 +4489,10 @@ export class AgentLoop {
       chatId,
       messageId: msg.metadata?.message_id ?? msg.metadata?.messageId ?? null,
       metadata: { ...msg.metadata, computerUseInteractive: false },
+      historyPrompt: msg.internal ? null : msg.content,
+      historyPromptTimestamp: msg.timestamp.toISOString(),
       sessionKey: key,
+      turnId: effectiveTurnId,
       pendingQueue,
       abortSignal,
       tools,
@@ -4493,7 +4535,7 @@ export class AgentLoop {
     this.sessions.save(session);
     this.enqueueSessionDagTurn(
       session,
-      turnId ?? firstString(msg.metadata?.turn_id, msg.metadata?.turnId) ?? cryptoRandomId(),
+      effectiveTurnId,
       dagMessageStart,
       session.messages.length,
       modelSelection,

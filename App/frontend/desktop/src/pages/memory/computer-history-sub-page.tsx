@@ -17,6 +17,7 @@ import { ScrollText, Trash2 } from "./memory-prototype-icons.js";
 import { ComputerHistoryPermissionGuide } from "./computer-history-permission-guide.js";
 import { readHistoryPermissionSetup, saveHistoryPermissionSetup } from "./computer-history-permission-state.js";
 import { ComputerHistoryRecordingConfirmation } from "./computer-history-recording-confirmation.js";
+import { CuHistoryPanel } from "./cu-history-panel.js";
 
 export interface ComputerHistorySubPageProps {
   client: MemmyAgentClient | null;
@@ -384,6 +385,8 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
           setPermissionSetup(null);
         }}
       /> : null}
+
+      <CuHistoryPanel client={props.client} />
 
       <div className="ch__head">
         <h4 className="ch__history-title text-sm font-semibold text-text-ink">

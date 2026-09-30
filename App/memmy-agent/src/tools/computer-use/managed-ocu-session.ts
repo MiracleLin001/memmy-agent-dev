@@ -6,7 +6,12 @@ import { computerUsePermissionError } from './mac-permission-settings.js';
 export const OCU_TOOLS = new Set(['list_apps', 'get_app_state', 'click', 'drag', 'perform_secondary_action', 'press_key', 'scroll', 'set_value', 'type_text']);
 export type OcuConnection = { session: any; close(): Promise<void> };
 export class OcuBlocked extends Error {
-  constructor(public readonly status: PermissionPreflight, message = 'Computer Use permission check failed') { super(message); }
+  constructor(
+    public readonly status: PermissionPreflight,
+    message = 'Computer Use permission check failed',
+    public readonly dispatched = false,
+    public readonly rawResult: unknown = null,
+  ) { super(message); }
 }
 export class OcuUncertain extends Error {}
 
@@ -180,7 +185,11 @@ export class ManagedOcuSession {
           const status = await this.showGuide({ state: 'missing', permission }, signal);
           cohort.checked = { generation: this.generation, status };
           this.preflight.remember(context, status, this.generation);
-          if (status.state === 'unknown' && status.reason === 'helperPauseFailed') throw new OcuBlocked(status);
+          // The native result has already come back. Keep it with the error so
+          // the recorder cannot mislabel this as a preflight-only block.
+          if (status.state === 'unknown' && status.reason === 'helperPauseFailed') {
+            throw new OcuBlocked(status, 'Computer Use permission guide could not pause helper', true, result);
+          }
         }
         return result;
       } catch (error) {

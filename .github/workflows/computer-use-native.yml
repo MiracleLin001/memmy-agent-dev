@@ -4,8 +4,24 @@ on:
   pull_request:
     paths:
       - ".github/workflows/computer-use-native.yml"
+      - "package.json"
+      - "package-lock.json"
       - "App/memmy-agent/package*.json"
       - "App/memmy-agent/src/tools/computer-use/**"
+      - "App/memmy-agent/src/core/agent-runtime/**"
+      - "App/memmy-agent/src/integrations/channels/websocket.ts"
+      - "App/memmy-agent/src/config/paths.ts"
+      - "App/memmy-agent/src/utils/artifacts.ts"
+      - "App/memmy-agent/src/utils/helpers.ts"
+      - "App/memmy-agent/tests/tools/computer-use/**"
+      - "App/memmy-agent/tests/core/agent-runtime/**"
+      - "App/frontend/desktop/package.json"
+      - "App/frontend/desktop/vite.config.ts"
+      - "App/frontend/desktop/src/**"
+      - "App/shell/desktop/interface/**"
+      - "App/backend/local-api-contracts/**"
+      - "Knowledge/**"
+      - "Migrations/**"
       - "App/shell/desktop/electron-builder*.yml"
       - "scripts/internal/shared/check-open-computer-use.mjs"
       - "scripts/internal/linux/**"
@@ -80,3 +96,74 @@ jobs:
       - name: Record validation boundary
         if: always()
         run: echo 'Native checks validate MCP discovery and, on Linux/Windows, desktop enumeration. Signed installers, permission prompts, screenshots and input still require desktop acceptance.' >> "$GITHUB_STEP_SUMMARY"
+
+  history-windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          architecture: x64
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            App/memmy-agent/package-lock.json
+      - name: Install workspace and Agent test dependencies
+        run: |
+          npm ci
+          npm ci --prefix App/memmy-agent
+      - name: Build shared test dependencies
+        run: |
+          npm --prefix App/memmy-agent run pretest
+          npm run build -w @memmy/desktop-interface
+      - name: Test Windows Agent CU History capture and read-only API
+        working-directory: App/memmy-agent
+        run: |
+          npm exec -- vitest run tests/tools/computer-use/history.test.ts \
+            --testNamePattern 'on win32|Windows OCU error' \
+            --reporter=default --reporter=json --outputFile=cu-history-windows-results.json
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const report = JSON.parse(fs.readFileSync('cu-history-windows-results.json', 'utf8'));
+          if (report.numPassedTests < 4 || report.numFailedTests !== 0) {
+            throw new Error(`Expected at least four passing Windows Agent CU History cases; got ${report.numPassedTests} passed and ${report.numFailedTests} failed`);
+          }
+          NODE
+      - name: Test Agent prompt ownership and MCP retry behavior
+        working-directory: App/memmy-agent
+        run: >-
+          npm exec -- vitest run
+          tests/core/agent-runtime/runner-injections.test.ts
+          tests/core/agent-runtime/mcp-transient-retry.test.ts
+          --reporter=default --reporter=json --outputFile=cu-history-runtime-results.json
+      - name: Test Windows desktop history navigation, viewer and API client
+        working-directory: App/frontend/desktop
+        run: >-
+          npm exec -- vitest run
+          src/pages/tests/computer-history-platform.interaction.test.tsx
+          src/pages/tests/cu-history-panel.integration.test.tsx
+          src/api/tests/memmy-agent-client.test.ts
+          --reporter=default --reporter=json --outputFile=cu-history-frontend-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-cu-history-test-results
+          path: |
+            App/memmy-agent/cu-history-windows-results.json
+            App/memmy-agent/cu-history-runtime-results.json
+            App/frontend/desktop/cu-history-frontend-results.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Record history validation boundary
+        if: always()
+        run: echo 'Windows Agent CU History tests use simulated OCU responses and a mocked desktop API. The native job checks MCP discovery and desktop enumeration; real GUI actions, screenshots and signed Electron installation still require desktop acceptance.' >> "$GITHUB_STEP_SUMMARY"

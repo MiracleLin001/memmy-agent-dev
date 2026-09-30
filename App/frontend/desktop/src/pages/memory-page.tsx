@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { buildMemorySubPageViewEvent } from "../analytics/page-view.js";
 import { useAnalytics } from "../analytics/use-analytics.js";
 import { useApiClients } from "../app/providers.js";
-import { isComputerHistorySupported } from "../app/computer-history-platform.js";
+import { isComputerHistorySupported, isStandaloneCuHistorySupported } from "../app/computer-history-platform.js";
 import {
   PRODUCT_TOUR_MEMORY_LOGS_NAV_ANCHOR,
   PRODUCT_TOUR_MEMORY_NAV_ANCHOR,
@@ -18,6 +18,7 @@ import { AppContentTopbar } from "./app-content-topbar.js";
 import { writeSettingsMemoryBudgetFocus, writeSettingsTabHash } from "./settings-nav.js";
 import { SidebarResizeHandle, useCodexResizableSidebar } from "./sidebar-resize.js";
 import { AnalyticsSubPage } from "./memory/analytics-sub-page.js";
+import { AgentCuHistorySubPage } from "./memory/agent-cu-history-sub-page.js";
 import { readHistoryPermissionSetup } from "./memory/computer-history-permission-state.js";
 import { isComputerHistoryQuotaExhausted, useComputerHistoryQuotaRefresh } from "./memory/computer-history-quota.js";
 import { ComputerHistorySubPage } from "./memory/computer-history-sub-page.js";
@@ -55,6 +56,7 @@ import {
 export type MemorySubPageId =
   | "overview"
   | "computer-history"
+  | "agent-cu-history"
   | "memories"
   | "user-memories"
   | "tasks"
@@ -87,7 +89,8 @@ const memoryNavSections: MemoryNavSection[] = [
       { id: "world-model", labelKey: "memory.nav.worldModel", icon: <Globe2 size={16} /> },
       { id: "skills", labelKey: "memory.nav.skills", icon: <Wand2 size={16} /> },
       { id: "user-memories", labelKey: "memory.nav.userMemories", icon: <UserRound size={16} /> },
-      { id: "computer-history", labelKey: "memory.nav.computerHistory", icon: <ScrollText size={16} /> }
+      { id: "computer-history", labelKey: "memory.nav.computerHistory", icon: <ScrollText size={16} /> },
+      { id: "agent-cu-history", labelKey: "memory.nav.agentCuHistory", icon: <ScrollText size={16} /> }
     ]
   },
   {
@@ -161,6 +164,7 @@ export function MemoryPage(props: MemoryPageProps) {
     () => ({
       overview: <OverviewSubPage client={client} onNavigate={handleSubPageChange} />,
       "computer-history": <ComputerHistorySubPage client={clients?.memmyAgent ?? null} quotaExhausted={historyQuotaExhausted} />,
+      "agent-cu-history": <AgentCuHistorySubPage client={clients?.memmyAgent ?? null} />,
       memories: (
         <MemoriesSubPage
           client={client}
@@ -207,6 +211,8 @@ export function MemoryPage(props: MemoryPageProps) {
       setActivePage(props.initialSubPage);
       return;
     }
+    // An explicit deep link has precedence over a page saved by an earlier visit.
+    if (typeof window !== "undefined" && isMemorySubPageId(new URLSearchParams(window.location.search).get("memoryPage"))) return;
     const stored = typeof window === "undefined" ? null : readMemorySubPage(window.sessionStorage);
     if (stored) {
       setActivePage(stored);
@@ -242,7 +248,13 @@ function isMemorySubPageId(value: string | null): value is MemorySubPageId {
 }
 
 function supportedMemorySubPage(page: MemorySubPageId): MemorySubPageId {
-  return page === "computer-history" && !isComputerHistorySupported() ? "overview" : page;
+  return isMemorySubPageSupported(page) ? page : "overview";
+}
+
+function isMemorySubPageSupported(page: MemorySubPageId): boolean {
+  if (page === "computer-history") return isComputerHistorySupported();
+  if (page === "agent-cu-history") return isStandaloneCuHistorySupported();
+  return true;
 }
 
 export function readMemorySubPage(storage: Storage | undefined): MemorySubPageId | null {
@@ -324,7 +336,7 @@ export function MemoryPageView(props: MemoryPageViewProps) {
               <span className="memory-page-section-label text-text-ink/45">{t(section.titleKey)}</span>
             </div>
             <nav className="space-y-1">
-              {section.items.filter((item) => item.id !== "computer-history" || isComputerHistorySupported()).map((item) => {
+              {section.items.filter((item) => isMemorySubPageSupported(item.id)).map((item) => {
                 const active = activePage === item.id;
                 return (
                   <div key={item.id}>
@@ -396,6 +408,7 @@ function createPreviewChildByPage(t: (key: MessageKey) => string): Record<Memory
   return {
     overview: <div>{t("memory.overview.total")}</div>,
     "computer-history": <div>{t("memory.nav.computerHistory")}</div>,
+    "agent-cu-history": <div>{t("memory.nav.agentCuHistory")}</div>,
     memories: <div>{t("memory.memories.title")}</div>,
     "user-memories": <div>{t("memory.userMemories.title")}</div>,
     tasks: <div>{t("memory.tasks.title")}</div>,

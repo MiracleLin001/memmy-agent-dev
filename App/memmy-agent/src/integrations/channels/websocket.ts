@@ -112,6 +112,12 @@ import {
 import type { ComputerHistoryDemoService } from "../../tools/computer-history/mac/computer-history-api.js";
 import { isComputerHistorySupported } from "../../tools/computer-history/platform.js";
 import {
+  ComputerUseHistoryError,
+  isComputerUseHistorySupported,
+  type ComputerUseHistoryKind,
+} from "../../tools/computer-use/history-store.js";
+import { ComputerUseHistoryService } from "../../tools/computer-use/history-service.js";
+import {
   removeSessionDagFiles,
   type SessionDagQueueManager,
 } from "../../session-dag/index.js";
@@ -712,6 +718,7 @@ export class WebSocketChannel extends BaseChannel {
   goalControlConnections = new Map<string, Set<any>>();
   dispatchingGoalControls = new Map<string, string>();
   readonly computerHistory: ComputerHistoryDemoService;
+  private computerUseHistoryService: ComputerUseHistoryService | null = null;
 
   constructor(config: any = {}, bus?: any, options: WebSocketChannelOptions = {}) {
     const normalized = config instanceof WebSocketConfig ? config : new WebSocketConfig(config);
@@ -2760,6 +2767,11 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/computer-history/observation/stop") return this.handleComputerHistory(request, "observation-stop");
     if (got === "/api/computer-history/workflows/create") return this.handleComputerHistory(request, "workflow-create");
     if (got === "/api/computer-history/app-icon") return this.handleComputerHistoryAppIcon(request);
+    if (got === "/api/cu-history/events") return this.handleComputerUseHistory(request, "events", null, query);
+    let cuHistoryMatch = got.match(/^\/api\/cu-history\/events\/([^/]+)$/);
+    if (cuHistoryMatch) return this.handleComputerUseHistory(request, "event", cuHistoryMatch[1], query);
+    cuHistoryMatch = got.match(/^\/api\/cu-history\/assets\/([^/]+)$/);
+    if (cuHistoryMatch) return this.handleComputerUseHistory(request, "asset", cuHistoryMatch[1], query);
     if (got === "/api/webui/sidebar-state") return this.handleWebuiSidebarState(request);
     if (got === "/api/webui/sidebar-state/update") return this.handleWebuiSidebarStateUpdate(request);
     if (got === "/api/webui/seed-chat") return this.handleWebuiSeedChat(request);
@@ -2915,6 +2927,68 @@ export class WebSocketChannel extends BaseChannel {
     } catch (error) {
       if (error instanceof ComputerHistoryApiError) return httpError(error.status, error.message);
       return httpError(500, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  handleComputerUseHistory(
+    request: any,
+    action: "events" | "event" | "asset",
+    encodedId: string | null,
+    query: Query = parseQuery(String(request?.path ?? "/")),
+  ): HttpLikeResponse {
+    const noStore = (response: HttpLikeResponse): HttpLikeResponse => ({
+      ...response, headers: { ...response.headers, "cache-control": "no-store" },
+    });
+    if (!this.checkApiToken(request)) return noStore(httpError(401, "Unauthorized"));
+    if (!isComputerUseHistorySupported()) return noStore(httpError(400, "Agent Computer Use history is available only on macOS and Windows"));
+    if ((request.method ?? "GET").toUpperCase() !== "GET") return noStore(httpError(405, "method not allowed"));
+
+    try {
+      const service = this.computerUseHistoryService ??= new ComputerUseHistoryService({ sessions: this.sessionManager });
+      if (action === "events") {
+        const single = (name: string): string | null => {
+          const values = query[name];
+          if (!values) return null;
+          if (values.length !== 1 || !values[0] || values[0].length > 4096) {
+            throw new ComputerUseHistoryError(400, `invalid_${name}`);
+          }
+          return values[0];
+        };
+        const rawLimit = single("limit");
+        if (rawLimit !== null && !/^\d{1,3}$/.test(rawLimit)) {
+          throw new ComputerUseHistoryError(400, "invalid_limit");
+        }
+        const sessionId = single("session_id");
+        const turnId = single("turn_id");
+        if ((sessionId && sessionId.length > 512) || (turnId && turnId.length > 512)) {
+          throw new ComputerUseHistoryError(400, "invalid_filter");
+        }
+        return noStore(httpJsonResponse(service.list({
+          limit: rawLimit === null ? undefined : Number(rawLimit),
+          cursor: single("cursor"),
+          from: single("from"),
+          to: single("to"),
+          kind: single("kind") as ComputerUseHistoryKind | null,
+          sessionId,
+          turnId,
+        })));
+      }
+      let id: string;
+      try { id = decodeURIComponent(encodedId ?? ""); }
+      catch { throw new ComputerUseHistoryError(400, "invalid_id"); }
+      if (!/^[A-Za-z0-9_-]{1,160}$/.test(id)) {
+        throw new ComputerUseHistoryError(400, "invalid_id");
+      }
+      if (action === "event") {
+        const event = service.get(id);
+        return noStore(event ? httpJsonResponse(event) : httpJsonResponse({ error: "event_not_found" }, { status: 404 }));
+      }
+      return noStore(httpJsonResponse(service.readAsset(id)));
+    } catch (error) {
+      if (error instanceof ComputerUseHistoryError) return noStore(httpJsonResponse({ error: error.code }, { status: error.status }));
+      // Filesystem errors may contain private local paths. Keep them out of
+      // the HTTP response while still allowing the next read to retry.
+      return noStore(httpJsonResponse({ error: "cu_history_unavailable" }, { status: 500 }));
     }
   }
 

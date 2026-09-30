@@ -584,6 +584,48 @@ describe("memmy-agent client", () => {
     });
   });
 
+  it("returns CU History evidence byte-for-byte without normalizing media-looking UI text", async () => {
+    const rawText = "The UI shows [literal](/api/media/sig-1/payload-1) exactly as typed.";
+    const event = {
+      id: "ui-1",
+      kind: "ui_text",
+      timestamp: "2026-09-30T09:00:00.000Z",
+      orderKey: "0000000000001-000000000001-12345678",
+      title: "Observed UI text",
+      summary: "Raw UI evidence",
+      source: "recorder",
+      sessionId: "session-1",
+      completeness: "complete",
+      missingReason: null,
+      metadata: { content: rawText, url: "/api/media/sig-1/payload-1" },
+      parentId: "call-1",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/webui/bootstrap") return json(bootstrap);
+      if (url.pathname === "/api/cu-history/events") return json({ events: [event], nextCursor: null });
+      if (url.pathname === "/api/cu-history/events/ui-1") {
+        return json({ ...event, text: rawText, args: null, result: null, screenshot: null });
+      }
+      if (url.pathname === "/api/cu-history/assets/asset-1") {
+        return json({ mimeType: "image/png", dataBase64: "AAAA" });
+      }
+      return json({ error: "not found" }, 404);
+    });
+    const client = createMemmyAgentClient({
+      baseUrl: "https://agent.local:18980",
+      clientId: "frontend-test",
+      fetchFn: fetchMock as typeof fetch,
+    });
+
+    const page = await client.listCuHistoryEvents();
+    expect(page.events[0]?.metadata).toEqual(event.metadata);
+    const detail = await client.getCuHistoryEvent("ui-1");
+    expect(detail.text).toBe(rawText);
+    expect(detail.metadata).toEqual(event.metadata);
+    await expect(client.getCuHistoryAsset("asset-1")).resolves.toEqual({ mimeType: "image/png", dataBase64: "AAAA" });
+  });
+
   it("requires WebUI thread Goal identity and outcome to be a valid pair", async () => {
     let payload: Record<string, unknown> = {
       schemaVersion: 3,

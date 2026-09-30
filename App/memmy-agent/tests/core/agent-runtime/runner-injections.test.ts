@@ -29,6 +29,44 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+it("moves Computer Use ownership to a steered WebUI message without mutating the previous context", async () => {
+  const loop = new AgentLoop({
+    bus: new MessageBus(),
+    provider: makeProvider(async () => new LLMResponse({ content: "done" })),
+    workspace: tmpRoot(), model: "test-model",
+  });
+  const pending = new AsyncQueue<InboundMessage>();
+  pending.put(new InboundMessage({
+    channel: "websocket", chatId: "chat", senderId: "user", content: "Inspect the new window",
+    timestamp: new Date("2026-09-30T10:00:00.000Z"),
+    metadata: { client_request_id: "steer-message", turn_id: "turn-1" },
+  }));
+  let before: any;
+  let after: any;
+  loop.runner.run = vi.fn(async (spec: any) => {
+    before = spec.computerUseHistory;
+    const injected = await spec.injectionCallback();
+    expect(injected).toHaveLength(1);
+    after = spec.computerUseHistory;
+    return {
+      finalContent: "done", content: "done", messages: [], toolCalls: [], toolsUsed: [],
+      usage: {}, response: { usage: {} }, stopReason: "completed", hadInjections: true,
+    } as any;
+  });
+
+  await loop.runAgentLoop([{ role: "user", content: "Original request" }], {
+    channel: "websocket", chatId: "chat", sessionKey: "websocket:chat", turnId: "turn-1",
+    historyPrompt: "Original request", historyPromptTimestamp: "2026-09-30T09:59:00.000Z",
+    pendingQueue: pending,
+  });
+  expect(before).toMatchObject({ turnId: "turn-1", promptText: "Original request" });
+  expect(after).toMatchObject({ turnId: "turn-1", messageId: "steer-message",
+    promptText: "Inspect the new window", promptTimestamp: "2026-09-30T10:00:00.000Z" });
+  expect(before.promptText).toBe("Original request");
+  expect(Object.isFrozen(before)).toBe(true);
+  expect(Object.isFrozen(after)).toBe(true);
+});
+
 function inbound(content: string, extra: Partial<ConstructorParameters<typeof InboundMessage>[0]> = {}): InboundMessage {
   return new InboundMessage({ channel: "cli", senderId: "u", chatId: "c", content, ...extra });
 }

@@ -26,6 +26,11 @@ import { isManagedOcuConfig, managedOcuEnvironment, openComputerUseEnvironment, 
 import { computerUsePermissionError } from "../../../tools/computer-use/mac-permission-settings.js";
 
 import { ManagedOcuSession, OcuBlocked, OcuUncertain } from "../../../tools/computer-use/managed-ocu-session.js";
+import {
+  computerUseRecordContext,
+  finishComputerUseRecording,
+  startComputerUseRecording,
+} from "../../../tools/computer-use/history-recorder.js";
 
 const TRANSIENT_EXC_NAMES = new Set([
   "ClosedResourceError",
@@ -480,30 +485,70 @@ export class MCPToolWrapper extends Tool {
   }
 
   async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string | Array<Record<string, any>>> {
-    if (context?.abortSignal?.aborted) return "(MCP tool call was cancelled)";
+    // Capture explicit, immutable turn ownership before any await. The wrapper
+    // is shared across sessions, while setContext has a mutable fallback.
+    const requestContext = this.requestContext.get();
+    const historyContext = computerUseRecordContext(context?.computerUseHistory, requestContext);
+    const startRecording = (attemptIndex: number) => this.serverName === "open_computer_use"
+      ? startComputerUseRecording({
+          server: this.serverName,
+          toolName: this.originalName,
+          args: params,
+          callId: context?.callId,
+          managed: Boolean(this.managed),
+          attemptIndex,
+          context: historyContext,
+        })
+      : null;
+    let recording = startRecording(1);
+    if (context?.abortSignal?.aborted) {
+      finishComputerUseRecording(recording, null, { status: "cancelled", dispatched: false, attemptCount: 1 });
+      return "(MCP tool call was cancelled)";
+    }
     if (this.managed) {
       try {
-        const result = await this.managed.invoke(this.originalName, params, this.toolTimeout, this.requestContext.get(), context?.abortSignal);
-        const permission = computerUsePermissionError(this.serverName, result);
+        const result = await this.managed.invoke(this.originalName, params, this.toolTimeout, requestContext, context?.abortSignal);
+        const permission = process.platform === "darwin" ? computerUsePermissionError(this.serverName, result) : null;
+        finishComputerUseRecording(recording, result, {
+          status: permission || result?.isError === true ? "error" : "ok",
+          dispatched: true,
+          attemptCount: 1,
+          error: permission ? `macOS permission denied: ${permission}` : null,
+        });
         if (permission) {
           context?.stopTurn?.(ocuPermissionMessage({ state: 'missing', permission }));
         }
         return convertMcpToolContent(result, 'auto');
       } catch (error) {
         if (error instanceof OcuUncertain) {
+          finishComputerUseRecording(recording, null, {
+            status: "uncertain", dispatched: true, attemptCount: 1, error: error.message,
+          });
           const message = 'Open Computer Use 在操作过程中断开，无法确认执行结果，操作未被重复执行。请检查当前界面，再发送新消息。';
           context?.stopTurn?.(message);
           return error.message;
         }
-        const status = error instanceof OcuBlocked ? error.status : { state: 'unknown' as const };
-        const message = ocuPermissionMessage(status);
+        const blocked = error instanceof OcuBlocked ? error : null;
+        const status = blocked?.status ?? { state: 'unknown' as const };
+        const message = blocked?.dispatched
+          ? 'Open Computer Use 已返回权限错误，但无法安全暂停辅助程序。授权设置未打开；请检查当前界面后重新发送消息。'
+          : ocuPermissionMessage(status);
+        finishComputerUseRecording(recording, blocked?.rawResult ?? null, {
+          status: blocked ? (blocked.dispatched ? "error" : "blocked") : "uncertain",
+          dispatched: blocked ? blocked.dispatched : null,
+          attemptCount: 1,
+          error: message,
+        });
         context?.stopTurn?.(message);
         return message;
       }
     }
     if (this.permissionPreflight && this.originalName !== 'list_apps') {
-      const status = await this.permissionPreflight.check(this.requestContext.get());
+      const status = await this.permissionPreflight.check(requestContext);
       if (status.state !== "granted") {
+        finishComputerUseRecording(recording, null, {
+          status: "blocked", dispatched: false, attemptCount: 1, error: ocuPermissionMessage(status),
+        });
         context?.stopTurn?.(ocuPermissionMessage(status));
         // doctor owns native onboarding. Opening Settings here as well races
         // its Allow/drag flow and leaves multiple permission windows visible.
@@ -512,7 +557,10 @@ export class MCPToolWrapper extends Tool {
           : "Computer Use could not verify its native macOS permissions. The requested application operation was not executed. Explain that the permission check failed and end this turn. Do not use another executor as a fallback; wait for a new user message before retrying.";
       }
     }
-    if (context?.abortSignal?.aborted) return "(MCP tool call was cancelled)";
+    if (context?.abortSignal?.aborted) {
+      finishComputerUseRecording(recording, null, { status: "cancelled", dispatched: false, attemptCount: 1 });
+      return "(MCP tool call was cancelled)";
+    }
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const result: any = await timeoutPromise(
@@ -520,19 +568,47 @@ export class MCPToolWrapper extends Tool {
           this.toolTimeout,
           "timeout",
         );
-        const permission = computerUsePermissionError(this.serverName, result);
-        if (permission) this.permissionPreflight?.deny(this.requestContext.get(), permission);
+        const permission = process.platform === "darwin" ? computerUsePermissionError(this.serverName, result) : null;
+        finishComputerUseRecording(recording, result, {
+          status: permission || result?.isError === true ? "error" : "ok",
+          dispatched: true,
+          attemptCount: attempt + 1,
+          error: permission ? `macOS permission denied: ${permission}` : null,
+        });
+        if (permission) this.permissionPreflight?.deny(requestContext, permission);
         if (permission && this.permissionPreflight) context?.stopTurn?.(ocuPermissionMessage({ state: 'missing', permission }));
         return convertMcpToolContent(result, "auto");
       } catch (error) {
         if (this.permissionPreflight) {
-          this.permissionPreflight.block(this.requestContext.get());
+          finishComputerUseRecording(recording, null, {
+            status: "uncertain", dispatched: true, attemptCount: attempt + 1,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          this.permissionPreflight.block(requestContext);
           context?.stopTurn?.('Open Computer Use 在操作过程中断开，无法确认执行结果，操作未被重复执行。请发送新消息后再试。');
           return 'Computer Use restarted or disconnected during the operation. Its result is unknown and it was not replayed.';
         }
-        if ((error as Error).message === "timeout") return `(MCP tool call timed out after ${this.toolTimeout}s)`;
-        if ((error as Error).name === "CancelledError") return "(MCP tool call was cancelled)";
-        if (isTransient(error) && attempt === 0) continue;
+        if ((error as Error).message === "timeout") {
+          finishComputerUseRecording(recording, null, { status: "timeout", dispatched: true, attemptCount: attempt + 1, error: "timeout" });
+          return `(MCP tool call timed out after ${this.toolTimeout}s)`;
+        }
+        if ((error as Error).name === "CancelledError") {
+          finishComputerUseRecording(recording, null, { status: "cancelled", dispatched: true, attemptCount: attempt + 1, error: "cancelled" });
+          return "(MCP tool call was cancelled)";
+        }
+        if (isTransient(error) && attempt === 0) {
+          finishComputerUseRecording(recording, null, {
+            status: "uncertain", dispatched: true, attemptCount: 1, error: (error as Error).name,
+          });
+          recording = startRecording(2);
+          continue;
+        }
+        finishComputerUseRecording(recording, null, {
+          status: isTransient(error) ? "uncertain" : "error",
+          dispatched: true,
+          attemptCount: attempt + 1,
+          error: error instanceof Error ? error.message : String(error),
+        });
         if (isTransient(error)) return `(MCP tool call failed after retry: ${(error as Error).name})`;
         return `(MCP tool call failed: ${(error as Error).name || "Error"})`;
       }

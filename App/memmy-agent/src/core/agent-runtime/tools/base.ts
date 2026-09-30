@@ -1,3 +1,5 @@
+import type { ComputerUseRecordContext } from "../../../tools/computer-use/history-store.js";
+
 export type JsonSchema = Record<string, any>;
 
 export type FileMutationOutcome = {
@@ -9,6 +11,8 @@ export type ToolExecutionContext = {
   abortSignal?: AbortSignal | null;
   toolName?: string;
   callId?: string | null;
+  /** Immutable turn ownership for Agent Computer Use recording. */
+  computerUseHistory?: ComputerUseRecordContext | null;
   /** Stop this run without asking the model to select another executor. */
   stopTurn?: (message: string) => void;
   reportFileMutation?: (outcome: FileMutationOutcome) => void;

@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { SCREEN_CAPTURE_PREFIX as PREFIX, SCREEN_CAPTURE_PROTOCOL, SCREEN_CAPTURE_MAX_BYTES, isScreenCaptureMessage, isScreenCaptureResult, type ScreenCaptureResult } from '@memmy/local-api-contracts';
 import { Tool, type ToolExecutionContext } from '../../core/agent-runtime/tools/base.js';
+import { RequestContext, RequestContextStore } from '../../core/agent-runtime/tools/context.js';
 import { convertMcpToolContent } from '../../core/agent-runtime/tools/mcp.js';
 import { isManagedOcuConfig } from './open-computer-use-binary.js';
+import { computerUseRecordContext, finishComputerUseRecording, startComputerUseRecording } from './history-recorder.js';
 
 type IpcProcess = Pick<NodeJS.Process, 'send' | 'connected' | 'on' | 'removeListener'>;
 export class DesktopScreenClient {
@@ -79,17 +81,59 @@ export class DesktopScreenCaptureTool extends Tool {
   static enabled(ctx: any): boolean { return screenCaptureEnabled(ctx.runtimeState ? { mcpServers: ctx.runtimeState.mcpServers } : ctx.config); }
   static create(ctx: any): DesktopScreenCaptureTool { return new DesktopScreenCaptureTool(() => screenCaptureEnabled(ctx.runtimeState ? { mcpServers: ctx.runtimeState.mcpServers } : ctx.config)); }
   constructor(private readonly enabledNow: () => boolean = () => false, private readonly client = desktopScreenClient) { super(); }
+  private readonly requestContext = new RequestContextStore();
+  setContext(context: RequestContext): void { this.requestContext.set(context); }
   get name(): string { return 'get_screen_state'; }
   get description(): string { return 'Observe the currently visible main screen, or a specified display_id, without opening, focusing or restoring any application. Call this tool for requests to see the current screen, including when permission has not been granted: it checks Memmy screen-recording permission and presents authorization guidance if needed. Do not infer permission from tool availability or prior messages. Never use Finder/get_app_state as a substitute.'; }
   get parameters() { return { type: 'object', properties: { display_id: { type: 'integer', minimum: 1 } }, additionalProperties: false }; }
   get exclusive(): boolean { return true; }
   async execute(params: { display_id?: number } = {}, context?: ToolExecutionContext): Promise<any> {
-    if (context?.abortSignal?.aborted) return 'Screen request cancelled';
-    if (!this.enabledNow()) { const message = 'Memmy 桌面截图工具已禁用或不可用。'; context?.stopTurn?.(message); return message; }
-    const result = await this.client.capture(params.display_id === undefined ? undefined : String(params.display_id), context?.abortSignal);
-    if (context?.abortSignal?.aborted) return 'Screen request cancelled';
-    if (!result.ok) { context?.stopTurn?.(result.message); return result.message; }
+    const recording = startComputerUseRecording({
+      server: 'memmy_desktop_capture',
+      toolName: 'get_screen_state',
+      args: params,
+      callId: context?.callId,
+      context: computerUseRecordContext(context?.computerUseHistory, this.requestContext.get()),
+    });
+    if (context?.abortSignal?.aborted) {
+      finishComputerUseRecording(recording, null, { status: 'cancelled', dispatched: false, attemptCount: 1 });
+      return 'Screen request cancelled';
+    }
+    if (!this.enabledNow()) {
+      const message = 'Memmy 桌面截图工具已禁用或不可用。';
+      finishComputerUseRecording(recording, { content: [{ type: 'text', text: message }], isError: true }, {
+        status: 'blocked', dispatched: false, attemptCount: 1, error: message,
+      });
+      context?.stopTurn?.(message);
+      return message;
+    }
+    let result: ScreenCaptureResult;
+    try {
+      result = await this.client.capture(params.display_id === undefined ? undefined : String(params.display_id), context?.abortSignal);
+    } catch (error) {
+      finishComputerUseRecording(recording, null, {
+        status: 'uncertain', dispatched: true, attemptCount: 1,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    if (context?.abortSignal?.aborted) {
+      finishComputerUseRecording(recording, null, { status: 'cancelled', dispatched: true, attemptCount: 1 });
+      return 'Screen request cancelled';
+    }
+    if (!result.ok) {
+      finishComputerUseRecording(recording, { content: [{ type: 'text', text: result.message }], isError: true }, {
+        status: result.code === 'permission_required' ? 'blocked' : 'error',
+        dispatched: true, attemptCount: 1, error: result.message,
+      });
+      context?.stopTurn?.(result.message);
+      return result.message;
+    }
     const { pngBase64, ...metadata } = result;
-    return convertMcpToolContent({ content: [{ type: 'text', text: JSON.stringify(metadata) }, { type: 'image', data: pngBase64, mimeType: 'image/png' }] }, 'auto');
+    const raw = { content: [{ type: 'text', text: JSON.stringify(metadata) }, { type: 'image', data: pngBase64, mimeType: 'image/png' }], isError: false };
+    // Store the original PNG before convertMcpToolContent creates its separate
+    // model artifact and before session persistence strips image_url blocks.
+    finishComputerUseRecording(recording, raw, { status: 'ok', dispatched: true, attemptCount: 1 });
+    return convertMcpToolContent(raw, 'auto');
   }
 }

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { getDataDir } from "../../config/paths.js";
-import { detectImageMime } from "../../utils/helpers.js";
+import { detectImageMime, extractReasoning } from "../../utils/helpers.js";
 import {
   ComputerUseHistoryError,
   ComputerUseHistoryStore,
@@ -42,6 +42,7 @@ const OCU_TOOL_SUFFIX = /^(?:list_apps|get_app_state|click|drag|perform_secondar
 const MAX_TRANSCRIPT_BYTES = 128 * 1024 * 1024;
 const MAX_LEGACY_IMAGE_BYTES = 20 * 1024 * 1024;
 const LEGACY_IMAGE_PATTERN = /\[image(?::\s*([^\]]+))?\]/g;
+const LEGACY_REASONING_TEXT_LIMIT = 8_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -107,6 +108,45 @@ function legacyUserText(message: Message): string {
       .map((block: any) => block.text).join("\n");
   }
   return "";
+}
+
+function normalizeLegacyReasoning(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return normalized.length <= LEGACY_REASONING_TEXT_LIMIT
+    ? normalized
+    : `${normalized.slice(0, LEGACY_REASONING_TEXT_LIMIT - 1).trimEnd()}…`;
+}
+
+function legacyAssistantReasoning(message: Message): string {
+  const content = typeof message.content === "string" ? message.content : legacyUserText(message);
+  const thinkingBlocks = Array.isArray(message.thinking_blocks) ? message.thinking_blocks : null;
+  const [reasoning] = extractReasoning(
+    typeof message.reasoning_content === "string" ? message.reasoning_content : null,
+    thinkingBlocks,
+    content,
+  );
+  const directField = [
+    message.reasoningSummary,
+    message.reasoning_summary,
+    message.thinkingBefore,
+    message.thinking_before,
+    message.reasoning,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  return normalizeLegacyReasoning(reasoning || directField);
+}
+
+function appendReasoningText(existing: string, next: string): string {
+  const current = normalizeLegacyReasoning(existing);
+  const incoming = normalizeLegacyReasoning(next);
+  if (!current) return incoming;
+  if (!incoming || current === incoming || current.endsWith(incoming)) return current;
+  if (incoming.startsWith(current)) return incoming;
+  return normalizeLegacyReasoning(`${current}${incoming}`);
 }
 
 type LegacyEvidence =
@@ -199,6 +239,14 @@ function legacyEvent(
   };
 }
 
+type LegacyReasoning = {
+  text: string;
+  timestamp: string;
+  key: string;
+  turnId: string | null;
+  orderIndex: number;
+};
+
 type LegacyCall = {
   source: "session" | "transcript";
   sessionId: string;
@@ -212,9 +260,34 @@ type LegacyCall = {
   resultMissing: boolean;
   error: string | null;
   prompt: { text: string; timestamp: string; key: string; turnId: string | null; orderIndex: number } | null;
+  reasoning: LegacyReasoning | null;
   orderIndex: number;
   evidence: LegacyEvidence[];
 };
+
+function legacyReasoningEvent(
+  call: LegacyCall,
+  parentId: string | null,
+): ComputerUseHistoryEvent | null {
+  const reasoning = call.reasoning;
+  if (!reasoning?.text) return null;
+  const sourceCode = call.source === "session" ? "s" : "t";
+  const id = stableId(sourceCode, [call.sessionId, "reasoning", reasoning.key, reasoning.text]);
+  return legacyEvent(
+    call.source, id, "reasoning", reasoning.timestamp, reasoning.orderIndex, call.sessionId,
+    "Agent reasoning summary", preview(reasoning.text),
+    call.source === "session" ? "legacy_reasoning_may_be_truncated" : "transcript_reasoning_is_sanitized",
+    {
+      toolName: call.name,
+      callId: call.callId,
+      turnId: call.turnId ?? reasoning.turnId,
+      origin: call.source,
+      reasoningId: id,
+    },
+    parentId,
+    { text: reasoning.text },
+  );
+}
 
 function legacyCallIdentity(call: LegacyCall): string | null {
   return call.callId ? `${call.sessionId}\0${call.callId}` : null;
@@ -295,34 +368,44 @@ function callsFromSessions(reader: ComputerUseSessionReader | null): LegacyCall[
           text,
           timestamp: dateString(message.timestamp, session.createdAt),
           key: `${session.key}:${index}`,
-          turnId: comparableCallId(message.turn_id),
+          turnId: comparableCallId(message.turn_id ?? message.turnId),
           orderIndex: index * 1_000_000,
         } : null;
       }
       if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+      const assistantReasoning = legacyAssistantReasoning(message);
       for (const [callIndex, call] of message.tool_calls.entries()) {
         const name = toolName(call);
         if (!name || !isComputerUseToolName(name)) continue;
         const callId = comparableCallId(call.id);
         const resultMessage = callId ? resultById.get(callId) : null;
         const result = resultMessage?.content ?? null;
-        const explicitTurnId = comparableCallId(message.turn_id);
+        const explicitTurnId = comparableCallId(message.turn_id ?? message.turnId);
         const matchedPrompt = explicitTurnId && currentPrompt?.turnId && explicitTurnId !== currentPrompt.turnId
           ? null : currentPrompt;
+        const reasoningTurnId = explicitTurnId ?? matchedPrompt?.turnId ?? null;
+        const timestamp = dateString(message.timestamp, matchedPrompt?.timestamp ?? session.createdAt);
         calls.push({
           source: "session",
           sessionId: session.key,
           key: `${session.key}:${index}:${callIndex}`,
           orderIndex: index * 1_000_000 + callIndex * 1_000,
-          timestamp: dateString(message.timestamp, matchedPrompt?.timestamp ?? session.createdAt),
+          timestamp,
           name,
           callId,
-          turnId: explicitTurnId ?? matchedPrompt?.turnId ?? null,
+          turnId: reasoningTurnId,
           args: parsedArgs((call as any)?.function?.arguments ?? (call as any)?.arguments),
           result,
           resultMissing: resultMessage == null,
           error: null,
           prompt: matchedPrompt,
+          reasoning: assistantReasoning ? {
+            text: assistantReasoning,
+            timestamp,
+            key: `${session.key}:${index}:reasoning`,
+            turnId: reasoningTurnId,
+            orderIndex: index * 1_000_000 + 1,
+          } : null,
           evidence: legacyEvidence(result),
         });
       }
@@ -358,6 +441,8 @@ function callsFromTranscripts(root: string): LegacyCall[] {
     const sessionId = `websocket:${name.slice("websocket_".length, -".jsonl".length)}`;
     let currentPrompt: LegacyCall["prompt"] = null;
     const promptByTurn = new Map<string, NonNullable<LegacyCall["prompt"]>>();
+    const reasoningByTurn = new Map<string, LegacyReasoning>();
+    let unkeyedReasoning: LegacyReasoning | null = null;
     const grouped = new Map<string, LegacyCall>();
     for (const [lineIndex, record] of lines.entries()) {
       const timestamp = transcriptCreatedAt(record, fallback);
@@ -369,6 +454,26 @@ function callsFromTranscripts(root: string): LegacyCall[] {
           turnId, orderIndex: lineIndex * 1_000_000,
         } : null;
         if (turnId && currentPrompt) promptByTurn.set(turnId, currentPrompt);
+      }
+      if (record.event === "reasoning_delta") {
+        const text = normalizeLegacyReasoning(record.text);
+        if (text) {
+          const key = turnId ? `${name}:turn:${turnId}` : `${name}:line:${lineIndex}`;
+          const existing = turnId ? reasoningByTurn.get(turnId) : unkeyedReasoning;
+          if (existing) {
+            existing.text = appendReasoningText(existing.text, text);
+          } else {
+            const next: LegacyReasoning = {
+              text,
+              timestamp,
+              key,
+              turnId,
+              orderIndex: lineIndex * 1_000_000 + 1,
+            };
+            if (turnId) reasoningByTurn.set(turnId, next);
+            else unkeyedReasoning = next;
+          }
+        }
       }
       if (!Array.isArray(record.tool_events)) continue;
       for (const [eventIndex, item] of record.tool_events.entries()) {
@@ -383,6 +488,9 @@ function callsFromTranscripts(root: string): LegacyCall[] {
           ? item.files.filter((value): value is string => typeof value === "string")
           : [];
         const evidence = legacyEvidence(rawResult, files);
+        const reasoning = (turnId ? reasoningByTurn.get(turnId) : null)
+          ?? (turnId && currentPrompt?.turnId === turnId ? unkeyedReasoning : null)
+          ?? (!turnId ? unkeyedReasoning : null);
         if (!existing) {
           grouped.set(key, {
             source: "transcript",
@@ -398,6 +506,7 @@ function callsFromTranscripts(root: string): LegacyCall[] {
             resultMissing: rawResult == null,
             error: typeof item.error === "string" ? item.error : null,
             prompt: turnId ? promptByTurn.get(turnId) ?? null : currentPrompt,
+            reasoning,
             evidence,
           });
         } else {
@@ -413,6 +522,7 @@ function callsFromTranscripts(root: string): LegacyCall[] {
             existing.turnId = turnId;
             existing.prompt = promptByTurn.get(turnId) ?? null;
           }
+          if (!existing.reasoning && reasoning) existing.reasoning = reasoning;
         }
       }
     }
@@ -541,6 +651,7 @@ export class ComputerUseHistoryService {
   private legacyEvents(calls: LegacyCall[], assetPaths: Map<string, string>): ComputerUseHistoryEvent[] {
     const events: ComputerUseHistoryEvent[] = [];
     const promptIds = new Set<string>();
+    const reasoningIds = new Set<string>();
     for (const call of calls) {
       let promptId: string | null = null;
       if (call.prompt) {
@@ -554,6 +665,12 @@ export class ComputerUseHistoryService {
             null, { text: call.prompt.text },
           ));
         }
+      }
+      const reasoningEvent = legacyReasoningEvent(call, promptId);
+      const reasoningId = reasoningEvent?.id ?? null;
+      if (reasoningEvent && !reasoningIds.has(reasoningEvent.id)) {
+        reasoningIds.add(reasoningEvent.id);
+        events.push(reasoningEvent);
       }
       const sourceCode = call.source === "session" ? "s" : "t";
       const callId = stableId(sourceCode, [call.sessionId, "tool_call", call.key]);
@@ -573,7 +690,7 @@ export class ComputerUseHistoryService {
         reason,
         {
           toolName: call.name, callId: call.callId, turnId: call.turnId, origin: call.source,
-          status: call.error ? "error" : "unknown", evidenceIds,
+          status: call.error ? "error" : "unknown", evidenceIds, reasoningId,
           correlation: call.callId ? "call_id" : "unverified_without_call_id",
         },
         promptId, { args: call.args, result: renderedResult },
@@ -624,6 +741,7 @@ export class ComputerUseHistoryService {
     const assetPaths = new Map<string, string>();
     const regularCalls: LegacyCall[] = [];
     const recoveries: Array<{ call: LegacyCall; recorder: ComputerUseHistoryEvent }> = [];
+    const reasoningBackfills: Array<{ call: LegacyCall; recorder: ComputerUseHistoryEvent }> = [];
     for (const call of preferredLegacyCalls([
       ...callsFromSessions(this.sessions),
       ...callsFromTranscripts(this.transcriptsRoot),
@@ -633,6 +751,12 @@ export class ComputerUseHistoryService {
         regularCalls.push(call);
         continue;
       }
+      if (call.reasoning && !captured.some((event) => event.kind === "reasoning"
+        && event.sessionId === call.sessionId
+        && event.text === call.reasoning?.text
+        && (event.metadata.turnId ?? null) === (call.turnId ?? call.reasoning.turnId ?? null))) {
+        reasoningBackfills.push({ call, recorder: [...recorded].sort(newerFirst)[0]! });
+      }
       // A completed recorder already contains the raw result. An unfinished
       // recorder may still have result evidence in the older session sources.
       if (recorded.every(recorderNeedsRecovery) && hasLegacyResultEvidence(call)) {
@@ -641,6 +765,21 @@ export class ComputerUseHistoryService {
       }
     }
     const projected = [...captured, ...this.legacyEvents(regularCalls, assetPaths)];
+    const backfilledReasoningIds = new Set<string>();
+    for (const { call, recorder } of reasoningBackfills) {
+      const reasoning = legacyReasoningEvent(call, recorder.parentId);
+      if (!reasoning || backfilledReasoningIds.has(reasoning.id)) continue;
+      backfilledReasoningIds.add(reasoning.id);
+      projected.push({
+        ...reasoning,
+        metadata: {
+          ...reasoning.metadata,
+          recoverySource: call.source,
+          recoveredForEventId: recorder.id,
+          sameExecution: true,
+        },
+      });
+    }
     for (const { call, recorder } of recoveries) {
       const legacy = this.legacyEvents([call], assetPaths);
       const legacyCall = legacy.find((event) => event.kind === "tool_call");
@@ -690,7 +829,7 @@ export class ComputerUseHistoryService {
     const from = validatedBound(query.from, "from");
     const to = validatedBound(query.to, "to");
     if (from && to && from > to) throw new ComputerUseHistoryError(400, "invalid_time_range");
-    if (query.kind && !["prompt", "tool_call", "ui_text", "screenshot"].includes(query.kind)) {
+    if (query.kind && !["prompt", "reasoning", "tool_call", "ui_text", "screenshot"].includes(query.kind)) {
       throw new ComputerUseHistoryError(400, "invalid_kind");
     }
     const cursor = cursorTuple(query.cursor);

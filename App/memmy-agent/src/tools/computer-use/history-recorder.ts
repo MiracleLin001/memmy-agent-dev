@@ -27,15 +27,29 @@ export function computerUseRecordContext(
   explicit: ComputerUseRecordContext | null | undefined,
   request: RequestContext | null | undefined,
 ): ComputerUseRecordContext {
-  if (explicit) return { ...explicit };
-  return {
+  const metadata = request?.metadata ?? {};
+  const context = explicit ? { ...explicit } : {
     sessionId: request?.sessionKey ?? null,
-    turnId: typeof request?.metadata?.turn_id === "string" ? request.metadata.turn_id : null,
+    turnId: typeof metadata.turn_id === "string" ? metadata.turn_id : null,
     messageId: request?.messageId ?? null,
     channel: request?.channel ?? null,
     chatId: request?.chatId ?? null,
     promptText: null,
     promptTimestamp: null,
+  } satisfies ComputerUseRecordContext;
+  const text = (key: string): string | null => typeof metadata[key] === "string" && metadata[key].trim()
+    ? metadata[key]
+    : null;
+  const iteration = typeof metadata.computerUseReasoningIteration === "number"
+    && Number.isSafeInteger(metadata.computerUseReasoningIteration)
+    ? metadata.computerUseReasoningIteration
+    : null;
+  return {
+    ...context,
+    ...(text("computerUseReasoning") ? { reasoning: text("computerUseReasoning") } : {}),
+    ...(text("computerUseReasoningSummary") ? { reasoningSummary: text("computerUseReasoningSummary") } : {}),
+    ...(text("computerUseThinkingBefore") ? { thinkingBefore: text("computerUseThinkingBefore") } : {}),
+    ...(iteration !== null ? { reasoningIteration: iteration } : {}),
   };
 }
 

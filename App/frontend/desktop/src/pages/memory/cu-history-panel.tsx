@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Image as ImageIcon, MessageSquareText, ScanText, Wrench } from "lucide-react";
+import { Brain, ChevronDown, Image as ImageIcon, MessageSquareText, ScanText, Wrench } from "lucide-react";
 import type {
   CuHistoryEvent,
   CuHistoryEventDetail,
@@ -17,16 +17,17 @@ const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "imag
 type HistoryFilter = Pick<CuHistoryListOptions, "kind" | "from" | "to" | "sessionId" | "turnId">;
 type Translate = ReturnType<typeof useTranslation>["t"];
 
-function formatTime(value: string): string {
+export function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString(undefined, {
     year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
   });
 }
 
-function eventKindLabel(kind: CuHistoryKind, t: Translate): string {
+export function eventKindLabel(kind: CuHistoryKind, t: Translate): string {
   const keys = {
     prompt: "computerHistory.raw.kind.prompt",
+    reasoning: "computerHistory.raw.kind.reasoning",
     tool_call: "computerHistory.raw.kind.tool_call",
     ui_text: "computerHistory.raw.kind.ui_text",
     screenshot: "computerHistory.raw.kind.screenshot",
@@ -34,7 +35,7 @@ function eventKindLabel(kind: CuHistoryKind, t: Translate): string {
   return t(keys[kind]);
 }
 
-function eventSourceLabel(source: CuHistoryEvent["source"], t: Translate): string {
+export function eventSourceLabel(source: CuHistoryEvent["source"], t: Translate): string {
   const keys = {
     recorder: "computerHistory.raw.source.recorder",
     session: "computerHistory.raw.source.session",
@@ -43,9 +44,10 @@ function eventSourceLabel(source: CuHistoryEvent["source"], t: Translate): strin
   return t(keys[source]);
 }
 
-function EventKindIcon(props: { kind: CuHistoryKind }) {
+export function EventKindIcon(props: { kind: CuHistoryKind }) {
   switch (props.kind) {
     case "prompt": return <MessageSquareText size={16} aria-hidden="true" />;
+    case "reasoning": return <Brain size={16} aria-hidden="true" />;
     case "tool_call": return <Wrench size={16} aria-hidden="true" />;
     case "ui_text": return <ScanText size={16} aria-hidden="true" />;
     case "screenshot": return <ImageIcon size={16} aria-hidden="true" />;
@@ -56,7 +58,7 @@ function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function missingReasonLabel(reason: string, t: Translate): string {
+export function missingReasonLabel(reason: string, t: Translate): string {
   switch (reason) {
     case "tool_result_pending": return t("computerHistory.raw.reason.pending");
     case "tool_outcome_unknown": return t("computerHistory.raw.reason.uncertain");
@@ -68,6 +70,8 @@ function missingReasonLabel(reason: string, t: Translate): string {
     case "legacy_tool_result_missing": return t("computerHistory.raw.reason.legacyNoResult");
     case "legacy_tool_result_may_be_truncated": return t("computerHistory.raw.reason.legacyResultTruncated");
     case "transcript_tool_result_is_sanitized": return t("computerHistory.raw.reason.transcriptSanitized");
+    case "legacy_reasoning_may_be_truncated": return t("computerHistory.raw.reason.legacyReasoningTruncated");
+    case "transcript_reasoning_is_sanitized": return t("computerHistory.raw.reason.transcriptReasoningSanitized");
     case "legacy_ui_text_may_be_truncated": return t("computerHistory.raw.reason.legacyUiTruncated");
     case "transcript_ui_text_is_sanitized": return t("computerHistory.raw.reason.transcriptUiSanitized");
     case "legacy_image_reference_only": return t("computerHistory.raw.reason.legacyImageReference");
@@ -80,7 +84,7 @@ function missingReasonLabel(reason: string, t: Translate): string {
   }
 }
 
-function callStatusLabel(status: string, t: Translate): string {
+export function callStatusLabel(status: string, t: Translate): string {
   const keys = {
     pending: "computerHistory.raw.status.pending",
     ok: "computerHistory.raw.status.ok",
@@ -109,7 +113,7 @@ function toLocalDayBoundary(day: string, endOfDay: boolean): string | undefined 
   return date.toISOString();
 }
 
-function asDisplayText(value: unknown): string {
+export function asDisplayText(value: unknown): string {
   if (typeof value === "string") return value;
   try {
     return JSON.stringify(value, null, 2) ?? String(value);
@@ -264,6 +268,7 @@ export function CuHistoryPanel(props: { client: MemmyAgentClient | null; standal
             <select value={draftKind} onChange={(event) => setDraftKind(event.target.value as CuHistoryKind | "all")}>
               <option value="all">{t("computerHistory.raw.kind.all")}</option>
               <option value="prompt">{t("computerHistory.raw.kind.prompt")}</option>
+              <option value="reasoning">{t("computerHistory.raw.kind.reasoning")}</option>
               <option value="tool_call">{t("computerHistory.raw.kind.tool_call")}</option>
               <option value="ui_text">{t("computerHistory.raw.kind.ui_text")}</option>
               <option value="screenshot">{t("computerHistory.raw.kind.screenshot")}</option>
@@ -346,13 +351,13 @@ export function CuHistoryPanel(props: { client: MemmyAgentClient | null; standal
   );
 }
 
-function CuHistoryDetail(props: {
+export function CuHistoryDetail(props: {
   client: MemmyAgentClient;
   eventId: string | null;
   fallback: CuHistoryEvent | null;
-  onViewSession: (sessionId: string) => void;
-  onViewTurn: (sessionId: string, turnId: string) => void;
-  onViewParent: (eventId: string) => void;
+  onViewSession?: (sessionId: string) => void;
+  onViewTurn?: (sessionId: string, turnId: string) => void;
+  onViewParent?: (eventId: string) => void;
 }) {
   const { t } = useTranslation();
   const [detail, setDetail] = useState<CuHistoryEventDetail | null>(null);
@@ -393,8 +398,8 @@ function CuHistoryDetail(props: {
     {detail.summary ? <p className="ch-raw__detail-summary">{detail.summary}</p> : null}
     <dl className="ch-raw__facts">
       <div><dt>{t("computerHistory.raw.source")}</dt><dd>{eventSourceLabel(detail.source, t)}</dd></div>
-      {detail.sessionId ? <div><dt>{t("computerHistory.raw.session")}</dt><dd>{detail.sessionId}<span className="ch-raw__detail-actions"><button type="button" className="ch-raw__view-session" onClick={() => props.onViewSession(detail.sessionId!)}>{t("computerHistory.raw.showSession")}</button>{turnId ? <button type="button" className="ch-raw__view-session" onClick={() => props.onViewTurn(detail.sessionId!, turnId)}>{t("computerHistory.raw.showTurn")}</button> : null}</span></dd></div> : null}
-      {detail.parentId ? <div><dt>{t("computerHistory.raw.parent")}</dt><dd>{detail.parentId}<button type="button" className="ch-raw__view-session" onClick={() => props.onViewParent(detail.parentId!)}>{t("computerHistory.raw.showParent")}</button></dd></div> : null}
+      {detail.sessionId ? <div><dt>{t("computerHistory.raw.session")}</dt><dd>{detail.sessionId}{props.onViewSession || (turnId && props.onViewTurn) ? <span className="ch-raw__detail-actions">{props.onViewSession ? <button type="button" className="ch-raw__view-session" onClick={() => props.onViewSession?.(detail.sessionId!)}>{t("computerHistory.raw.showSession")}</button> : null}{turnId && props.onViewTurn ? <button type="button" className="ch-raw__view-session" onClick={() => props.onViewTurn?.(detail.sessionId!, turnId)}>{t("computerHistory.raw.showTurn")}</button> : null}</span> : null}</dd></div> : null}
+      {detail.parentId ? <div><dt>{t("computerHistory.raw.parent")}</dt><dd>{detail.parentId}{props.onViewParent ? <button type="button" className="ch-raw__view-session" onClick={() => props.onViewParent?.(detail.parentId!)}>{t("computerHistory.raw.showParent")}</button> : null}</dd></div> : null}
       {callStatus ? <div><dt>{t("computerHistory.raw.callStatus")}</dt><dd>{callStatusLabel(callStatus, t)}</dd></div> : null}
       <div><dt>{t("computerHistory.raw.completeness")}</dt><dd>{t(detail.completeness === "partial" ? "computerHistory.raw.partial" : "computerHistory.raw.complete")}</dd></div>
     </dl>

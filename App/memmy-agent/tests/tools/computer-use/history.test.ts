@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MessageBus } from "../../../src/core/runtime-messages/index.js";
+import { AgentHookContext } from "../../../src/core/agent-runtime/hook.js";
+import { AgentProgressHook } from "../../../src/core/agent-runtime/progress-hook.js";
 import { RequestContext } from "../../../src/core/agent-runtime/tools/context.js";
 import { MCPToolWrapper } from "../../../src/core/agent-runtime/tools/mcp.js";
 import { WebSocketChannel } from "../../../src/integrations/channels/websocket.js";
@@ -162,6 +164,95 @@ describe("Agent Computer Use recording and HTTP history", () => {
     });
     expect(invalid).not.toBeNull();
     expect(writer.getEvent(invalid!)?.metadata.timestampSource).toBe("capture");
+  });
+
+  it("records one reasoning summary per tool iteration and links every tool call", () => {
+    const writer = historyStore();
+    const context = {
+      sessionId: "websocket:reasoning", turnId: "reasoning-turn", messageId: "reasoning-message",
+      promptText: "Inspect the current window", reasoning: "先读取当前窗口，再根据界面状态决定下一步。",
+      reasoningSummary: "先读取当前窗口，再根据界面状态决定下一步。",
+      thinkingBefore: "先读取当前窗口，再根据界面状态决定下一步。", reasoningIteration: 3,
+    };
+    const first = writer.startToolCall({ server: "open_computer_use", toolName: "get_app_state", callId: "reasoning-call-1", args: {}, context });
+    const second = writer.startToolCall({ server: "open_computer_use", toolName: "list_apps", callId: "reasoning-call-2", args: {}, context });
+    const rows = writer.readEvents().sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    expect(rows.map((row) => row.kind)).toEqual(["prompt", "reasoning", "tool_call", "tool_call"]);
+    const reasoning = rows.find((row) => row.kind === "reasoning")!;
+    expect(reasoning).toMatchObject({ sessionId: "websocket:reasoning", parentId: rows[0]?.id, text: context.reasoning });
+    expect(reasoning.metadata).toMatchObject({ turnId: "reasoning-turn", reasoningIteration: 3 });
+    expect(first.id).not.toBe(second.id);
+    expect(writer.getEvent(first.id)?.metadata.reasoningId).toBe(reasoning.id);
+    expect(writer.getEvent(second.id)?.metadata.reasoningId).toBe(reasoning.id);
+    expect(new ComputerUseHistoryService({ store: historyStore() }).list({ kind: "reasoning", turnId: "reasoning-turn" }).events)
+      .toEqual([expect.objectContaining({ id: reasoning.id, kind: "reasoning" })]);
+  });
+
+  it("bridges Agent reasoning emitted before a tool into the CU recorder", async () => {
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Window is visible" }] });
+    const wrapper = new MCPToolWrapper({ callTool }, "open_computer_use", {
+      name: "get_app_state", description: "Read app", inputSchema: { type: "object", properties: {} },
+    });
+    const hook = new AgentProgressHook(null, null, null, {
+      channel: "websocket",
+      chatId: "reasoning-chat",
+      sessionKey: "websocket:reasoning-chat",
+      setToolContext: (channel, chatId, messageId, metadata, sessionKey) => wrapper.setContext(new RequestContext({
+        channel, chatId, messageId, metadata, sessionKey,
+      })),
+    });
+    await hook.beforeIteration(new AgentHookContext({ iteration: 2 }));
+    await hook.emitReasoning("先读取窗口状态，再决定下一步。");
+    await hook.beforeExecuteTools(new AgentHookContext({
+      iteration: 2,
+      response: { content: "", reasoningContent: null, thinkingBlocks: null },
+      toolCalls: [{ name: "mcp_open_computer_use_get_app_state" }],
+    }));
+    await wrapper.execute({}, { callId: "reasoning-bridge", computerUseHistory: {
+      sessionId: "websocket:reasoning-chat", turnId: "reasoning-bridge-turn", promptText: "Inspect the window",
+    } });
+    const rows = historyStore().readEvents().sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    const reasoning = rows.find((row) => row.kind === "reasoning");
+    expect(reasoning?.text).toContain("先读取窗口状态");
+    expect(reasoning?.metadata.reasoningIteration).toBe(2);
+    expect(rows.find((row) => row.kind === "tool_call")?.metadata.reasoningId).toBe(reasoning?.id);
+  });
+
+  it("accepts structured reasoning fields on the Agent response", async () => {
+    const wrapper = new MCPToolWrapper(
+      { callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Done" }] }) },
+      "open_computer_use",
+      { name: "get_app_state", description: "Read app", inputSchema: { type: "object", properties: {} } },
+    );
+    const hook = new AgentProgressHook(null, null, null, {
+      channel: "websocket",
+      chatId: "structured-reasoning-chat",
+      sessionKey: "websocket:structured-reasoning-chat",
+      setToolContext: (channel, chatId, messageId, metadata, sessionKey) => wrapper.setContext(new RequestContext({
+        channel, chatId, messageId, metadata, sessionKey,
+      })),
+    });
+    await hook.beforeIteration(new AgentHookContext({ iteration: 4 }));
+    await hook.beforeExecuteTools(new AgentHookContext({
+      iteration: 4,
+      response: {
+        content: "",
+        reasoning: "先读取 reasoning 字段，再执行工具。",
+        reasoningSummary: "先读取 reasoning 字段，再执行工具。",
+        thinkingBefore: "先读取 reasoning 字段，再执行工具。",
+      },
+      toolCalls: [{ name: "mcp_open_computer_use_get_app_state" }],
+    }));
+    await wrapper.execute({}, {
+      callId: "structured-reasoning-call",
+      computerUseHistory: {
+        sessionId: "websocket:structured-reasoning-chat",
+        turnId: "structured-reasoning-turn",
+        promptText: "Inspect the window",
+      },
+    });
+    const rows = historyStore().readEvents().sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    expect(rows.find((row) => row.kind === "reasoning")?.text).toBe("先读取 reasoning 字段，再执行工具。");
   });
 
   it("cleans an unfinished atomic event file when disk writing fails", () => {
@@ -359,6 +450,77 @@ describe("Agent Computer Use recording and HTTP history", () => {
 });
 
 describe("partial legacy Computer Use evidence", () => {
+  it("projects reasoning from legacy session messages and binds it to the tool", () => {
+    const service = new ComputerUseHistoryService({
+      store: historyStore(),
+      sessions: { listSessionRecords: () => [{ key: "websocket:legacy-reasoning", messages: [
+        { role: "user", content: "Inspect Notes", turn_id: "legacy-reasoning-turn" },
+        {
+          role: "assistant", turn_id: "legacy-reasoning-turn", reasoning_content: "先读取窗口，再决定下一步。",
+          tool_calls: [{ id: "legacy-reasoning-call", function: { name: "mcp_open_computer_use_get_app_state", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "legacy-reasoning-call", content: [{ type: "text", text: "Notes is open" }] },
+      ] }] },
+    });
+
+    const rows = service.list({ sessionId: "websocket:legacy-reasoning" }).events;
+    const reasoning = rows.find((event) => event.kind === "reasoning");
+    const tool = rows.find((event) => event.kind === "tool_call");
+    expect(reasoning).toMatchObject({ source: "session", metadata: {
+      turnId: "legacy-reasoning-turn", callId: "legacy-reasoning-call",
+    } });
+    expect(tool?.metadata.reasoningId).toBe(reasoning?.id);
+    expect(service.get(reasoning!.id)?.text).toBe("先读取窗口，再决定下一步。");
+  });
+
+  it("backfills reasoning beside an already recorded tool call without duplicating the call", () => {
+    const writer = historyStore();
+    const recorded = writer.startToolCall({
+      server: "open_computer_use", toolName: "get_app_state", callId: "backfill-call", args: {},
+      context: {
+        sessionId: "websocket:backfill-reasoning", turnId: "backfill-turn", promptText: "Inspect Notes",
+      },
+    });
+    const service = new ComputerUseHistoryService({
+      store: writer,
+      sessions: { listSessionRecords: () => [{ key: "websocket:backfill-reasoning", messages: [
+        { role: "user", content: "Inspect Notes", turn_id: "backfill-turn" },
+        {
+          role: "assistant", turn_id: "backfill-turn", reasoning_content: "从旧会话补回思路摘要。",
+          tool_calls: [{ id: "backfill-call", function: { name: "mcp_open_computer_use_get_app_state", arguments: "{}" } }],
+        },
+      ] }] },
+    });
+
+    const rows = service.list({ sessionId: "websocket:backfill-reasoning" }).events;
+    expect(rows.filter((event) => event.kind === "tool_call").map((event) => event.id)).toEqual([recorded.id]);
+    const reasoning = rows.find((event) => event.kind === "reasoning");
+    expect(reasoning).toMatchObject({ source: "session", metadata: {
+      recoveredForEventId: recorded.id, sameExecution: true,
+    }, parentId: writer.getEvent(recorded.id)?.parentId });
+    expect(service.get(reasoning!.id)?.text).toBe("从旧会话补回思路摘要。");
+  });
+
+  it("projects reasoning deltas from a legacy WebUI transcript", () => {
+    const webuiRoot = path.join(dataRoot, "webui");
+    fs.mkdirSync(webuiRoot, { recursive: true });
+    fs.writeFileSync(path.join(webuiRoot, "websocket_transcript-reasoning.jsonl"), [
+      { event: "user", turn_id: "transcript-reasoning-turn", text: "Inspect", createdAt: "2026-09-30T00:00:00.000Z" },
+      { event: "reasoning_delta", turn_id: "transcript-reasoning-turn", text: "先看窗口", createdAt: "2026-09-30T00:00:01.000Z" },
+      { event: "reasoning_delta", turn_id: "transcript-reasoning-turn", text: "再执行工具。", createdAt: "2026-09-30T00:00:01.100Z" },
+      { event: "message", turn_id: "transcript-reasoning-turn", createdAt: "2026-09-30T00:00:02.000Z", tool_events: [{
+        name: "mcp_open_computer_use_get_app_state", call_id: "transcript-reasoning-call", result: "Visible",
+      }] },
+    ].map((row) => JSON.stringify(row)).join("\n"));
+    const service = new ComputerUseHistoryService({ store: historyStore(), transcriptsRoot: webuiRoot });
+
+    const rows = service.list({ sessionId: "websocket:transcript-reasoning" }).events;
+    const reasoning = rows.find((event) => event.kind === "reasoning");
+    const tool = rows.find((event) => event.kind === "tool_call");
+    expect(service.get(reasoning!.id)?.text).toBe("先看窗口再执行工具。");
+    expect(tool?.metadata.reasoningId).toBe(reasoning?.id);
+  });
+
   it("attaches a legacy result to an unfinished recorder call without projecting a second execution", () => {
     const mediaRoot = path.join(dataRoot, "media", "tool-results");
     fs.mkdirSync(mediaRoot, { recursive: true });

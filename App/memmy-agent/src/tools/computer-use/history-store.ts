@@ -8,7 +8,7 @@ import { detectImageMime } from "../../utils/helpers.js";
  * Agent Computer Use evidence is deliberately separate from the human
  * Computer History recorder. The latter never records screenshots by default.
  */
-export type ComputerUseHistoryKind = "prompt" | "tool_call" | "ui_text" | "screenshot";
+export type ComputerUseHistoryKind = "prompt" | "reasoning" | "tool_call" | "ui_text" | "screenshot";
 export type ComputerUseHistorySource = "recorder" | "session" | "transcript";
 export type ComputerUseHistoryCompleteness = "complete" | "partial";
 export type ComputerUseCallStatus =
@@ -50,6 +50,11 @@ export interface ComputerUseRecordContext {
   channel?: string | null;
   chatId?: string | null;
   promptText?: string | null;
+  /** Reasoning already exposed by the Agent UI, kept as an auditable summary. */
+  reasoning?: string | null;
+  reasoningSummary?: string | null;
+  thinkingBefore?: string | null;
+  reasoningIteration?: number | null;
   /** Original inbound message time when available; capture order uses orderKey. */
   promptTimestamp?: string | null;
 }
@@ -80,9 +85,10 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 };
 const IMAGE_LIMIT_BYTES = 20 * 1024 * 1024;
 const EVENT_LIMIT_BYTES = 64 * 1024 * 1024;
-const RECORD_ID = /^\d{4}-\d{2}-\d{2}-(?:[a-f0-9-]{36}|p-[a-f0-9]{40})$/;
+const RECORD_ID = /^\d{4}-\d{2}-\d{2}-(?:[a-f0-9-]{36}|[pr]-[a-f0-9]{40})$/;
 const ASSET_ID = /^[a-f0-9]{64}$/;
 const ORDER_KEY = /^\d{13}-\d{12}-[a-f0-9]{8}$/;
+const REASONING_TEXT_LIMIT = 8_000;
 
 export function isComputerUseHistorySupported(platform = process.platform): boolean {
   return platform === "darwin" || platform === "win32";
@@ -91,6 +97,34 @@ export function isComputerUseHistorySupported(platform = process.platform): bool
 function compactPreview(text: string, limit = 180): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length > limit ? `${oneLine.slice(0, limit - 1)}…` : oneLine;
+}
+
+function normalizeReasoningText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value
+    .replace(/<\/?(?:think|thinking|reasoning)>/gi, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (normalized.length <= REASONING_TEXT_LIMIT) return normalized;
+  return `${normalized.slice(0, REASONING_TEXT_LIMIT - 1).trimEnd()}…`;
+}
+
+function reasoningParts(context: ComputerUseRecordContext): Array<{ source: string; text: string }> {
+  const seen = new Set<string>();
+  const parts: Array<{ source: string; text: string }> = [];
+  for (const [source, value] of [
+    ["reasoningSummary", context.reasoningSummary],
+    ["thinkingBefore", context.thinkingBefore],
+    ["reasoning", context.reasoning],
+  ] as const) {
+    const text = normalizeReasoningText(value);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    parts.push({ source, text });
+  }
+  return parts;
 }
 
 function digest(value: string | Buffer): string {
@@ -208,6 +242,19 @@ export class ComputerUseHistoryStore {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
         const id = `${day}-p-${identity}`;
         if (this.getEvent(id)?.kind === "prompt") return id;
+      }
+    } catch {
+      // The history directory has not been created yet.
+    }
+    return null;
+  }
+
+  private recordedReasoningId(identity: string): string | null {
+    try {
+      for (const day of fs.readdirSync(this.eventsRoot).sort().reverse()) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+        const id = `${day}-r-${identity}`;
+        if (this.getEvent(id)?.kind === "reasoning") return id;
       }
     } catch {
       // The history directory has not been created yet.
@@ -336,6 +383,53 @@ export class ComputerUseHistoryStore {
     return id;
   }
 
+  recordReasoning(
+    context: ComputerUseRecordContext,
+    details: { toolName?: string | null; callId?: string | null; parentId?: string | null } = {},
+  ): string | null {
+    const parts = reasoningParts(context);
+    if (!parts.length) return null;
+    const text = parts.map((part) => part.text).join("\n\n");
+    const sessionId = context.sessionId ?? null;
+    const turnId = context.turnId ?? null;
+    const iteration = Number.isSafeInteger(context.reasoningIteration) ? context.reasoningIteration : null;
+    const identity = digest(JSON.stringify([
+      sessionId,
+      turnId,
+      context.messageId ?? null,
+      iteration,
+      text,
+    ])).slice(0, 40);
+    const existing = this.recordedReasoningId(identity);
+    if (existing) return existing;
+    const timestamp = new Date().toISOString();
+    const id = `${timestamp.slice(0, 10)}-r-${identity}`;
+    this.writeEvent(this.newEvent({
+      kind: "reasoning",
+      timestamp,
+      title: "Agent reasoning summary",
+      summary: compactPreview(text),
+      source: "recorder",
+      sessionId,
+      completeness: "complete",
+      missingReason: null,
+      metadata: {
+        turnId,
+        messageId: context.messageId ?? null,
+        reasoningSources: parts.map((part) => part.source),
+        reasoningIteration: iteration,
+        toolName: details.toolName ?? null,
+        callId: details.callId ?? null,
+      },
+      parentId: details.parentId ?? this.recordPrompt(context),
+      text,
+      args: null,
+      result: null,
+      screenshot: null,
+    }, id));
+    return id;
+  }
+
   startToolCall(input: {
     server: string;
     toolName: string;
@@ -347,6 +441,11 @@ export class ComputerUseHistoryStore {
   }): ComputerUseCallHandle {
     const context = input.context ?? {};
     const promptId = this.recordPrompt(context);
+    const reasoningId = this.recordReasoning(context, {
+      toolName: input.toolName,
+      callId: input.callId,
+      parentId: promptId,
+    });
     const timestamp = new Date().toISOString();
     const event = this.newEvent({
       kind: "tool_call",
@@ -365,6 +464,7 @@ export class ComputerUseHistoryStore {
         attemptIndex: input.attemptIndex ?? 1,
         turnId: context.turnId ?? null,
         messageId: context.messageId ?? null,
+        reasoningId,
         status: "pending",
         attemptCount: 0,
         dispatched: null,
@@ -521,7 +621,7 @@ export class ComputerUseHistoryStore {
       if (!stat.isFile() || stat.size <= 0 || stat.size > EVENT_LIMIT_BYTES) return null;
       const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
       if (!recordObject(parsed) || parsed.id !== id || parsed.source !== "recorder"
-        || !["prompt", "tool_call", "ui_text", "screenshot"].includes(String(parsed.kind))
+        || !["prompt", "reasoning", "tool_call", "ui_text", "screenshot"].includes(String(parsed.kind))
         || typeof parsed.timestamp !== "string" || !Number.isFinite(Date.parse(parsed.timestamp))
         || typeof parsed.title !== "string" || typeof parsed.summary !== "string"
         || !nullableString(parsed.sessionId)

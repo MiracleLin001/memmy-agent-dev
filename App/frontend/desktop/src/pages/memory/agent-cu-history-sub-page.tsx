@@ -2,6 +2,7 @@ import type { MemmyAgentClient } from "../../api/memmy-agent-client.js";
 import { useTranslation } from "../../i18n/use-translation.js";
 import { ScrollText } from "./memory-prototype-icons.js";
 import { CuHistoryPanel } from "./cu-history-panel.js";
+import { CuHistoryStitchedPanel } from "./cu-history-stitched-panel.js";
 
 /** Windows view of Agent CU evidence, separate from macOS human activity recording. */
 export function AgentCuHistorySubPage(props: { client: MemmyAgentClient | null }) {
@@ -15,6 +16,7 @@ export function AgentCuHistorySubPage(props: { client: MemmyAgentClient | null }
         </h3>
       </div>
     </header>
+    <CuHistoryStitchedPanel client={props.client} />
     <CuHistoryPanel client={props.client} standalone />
   </section>;
 }

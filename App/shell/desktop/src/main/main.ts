@@ -3743,6 +3743,22 @@ function createMainWindow(target: RendererRouteTarget | null = null): BrowserWin
   });
   mainWindow = targetMainWindow;
 
+  // Chromium can create the native window without making it visible in some
+  // managed Windows sessions (especially after a previous forced kill). Make
+  // the initial development window deterministic: center it on the primary
+  // work area, restore it, and bring it to the foreground once the renderer is
+  // ready.
+  targetMainWindow.center();
+  const revealMainWindow = (): void => {
+    if (targetMainWindow.isDestroyed()) return;
+    if (targetMainWindow.isMinimized()) targetMainWindow.restore();
+    targetMainWindow.show();
+    targetMainWindow.focus();
+    // Windows may keep a newly created window behind the current foreground
+    // app after a previous forced termination; move it to the top explicitly.
+    targetMainWindow.moveTop();
+  };
+
   hideInWindowMenuBar(targetMainWindow);
   updateFullWindowButtonPosition(targetMainWindow);
   attachWindowOpenHandler(targetMainWindow);
@@ -3758,8 +3774,14 @@ function createMainWindow(target: RendererRouteTarget | null = null): BrowserWin
 
   void targetMainWindow.loadURL(resolveRendererUrl("full", target)).catch(handleRendererLoadFailure);
   // The main window takes over from the splash when its renderer is ready.
-  targetMainWindow.once("ready-to-show", () => closeSplashWindow("main-ready-to-show"));
-  targetMainWindow.webContents.once("did-finish-load", () => closeSplashWindow("main-did-finish-load"));
+  targetMainWindow.once("ready-to-show", () => {
+    revealMainWindow();
+    closeSplashWindow("main-ready-to-show");
+  });
+  targetMainWindow.webContents.once("did-finish-load", () => {
+    revealMainWindow();
+    closeSplashWindow("main-did-finish-load");
+  });
 
   targetMainWindow.on("closed", () => {
     mainWindow = null;

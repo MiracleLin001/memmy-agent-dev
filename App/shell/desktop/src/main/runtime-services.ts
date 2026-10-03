@@ -136,6 +136,13 @@ const DESKTOP_MANAGED_MEMORY_ENV = "MEMMY_DESKTOP_MANAGED_MEMORY";
 const MEMORY_RESTART_IPC_TYPE = "memmy-memory:restart";
 const DESKTOP_MANAGED_GATEWAY_ENV = "MEMMY_DESKTOP_MANAGED_GATEWAY";
 const BROWSER_PREPARATION_ATTEMPT_ID_ENV = "MEMMY_BROWSER_PREPARATION_ATTEMPT_ID";
+/**
+ * Optional startup escape hatch for development environments where the
+ * Playwright browser download is too expensive to run alongside Electron.
+ * The browser tool will see the matching unavailable state and fail fast
+ * instead of waiting for a preparation child that was intentionally skipped.
+ */
+const DISABLE_BROWSER_PREPARATION_ENV = "MEMMY_DISABLE_BROWSER_PREPARATION";
 const MANAGED_RESTART_IPC_TYPE = "memmy-agent:restart";
 const MIGRATIONS_READY_CONFIG_ENV = "MEMMY_MIGRATIONS_READY_CONFIG";
 const MIGRATIONS_READY_WORKSPACE_ENV = "MEMMY_MIGRATIONS_READY_WORKSPACE";
@@ -237,13 +244,25 @@ export async function startManagedRuntimeServices(
       agentEntry: entries.agentEntry,
       agentWorkspace: runtimeConfig.agentWorkspace
     });
-    browserPreparation = startPackagedBrowserPreparation(
-      entries,
-      runtimeConfig,
-      options,
-      spawn,
-      browserPreparationAttemptId
-    );
+    if (process.env[DISABLE_BROWSER_PREPARATION_ENV] === "1") {
+      const disabledAt = new Date().toISOString();
+      writeDesktopBrowserPreparationState(runtimeConfig.configPath, {
+        status: "unavailable",
+        attemptId: browserPreparationAttemptId,
+        startedAt: disabledAt,
+        lastProgressAt: disabledAt,
+        progressPercent: 0,
+        error: `browser preparation disabled by ${DISABLE_BROWSER_PREPARATION_ENV}=1`
+      });
+    } else {
+      browserPreparation = startPackagedBrowserPreparation(
+        entries,
+        runtimeConfig,
+        options,
+        spawn,
+        browserPreparationAttemptId
+      );
+    }
     const memoryReady = ensureMemoryService(
       entries,
       runtimeConfig,

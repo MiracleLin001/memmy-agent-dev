@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Raw, read-only Computer Use history is separate from human activity summaries. */
-export const CuHistoryKindSchema = z.enum(["prompt", "tool_call", "ui_text", "screenshot"]);
+export const CuHistoryKindSchema = z.enum(["prompt", "reasoning", "tool_call", "ui_text", "screenshot"]);
 export type CuHistoryKind = z.infer<typeof CuHistoryKindSchema>;
 
 export const CuHistoryEventSchema = z.object({

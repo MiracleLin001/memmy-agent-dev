@@ -1,5 +1,5 @@
 import { AgentHook, AgentHookContext } from "./hook.js";
-import { IncrementalThinkExtractor, stripThink } from "../../utils/helpers.js";
+import { extractReasoning, IncrementalThinkExtractor, stripThink } from "../../utils/helpers.js";
 import {
   buildToolEventFinishPayloads,
   buildToolEventStartPayload,
@@ -26,6 +26,7 @@ export class AgentProgressHook extends AgentHook {
   private streamBuf = "";
   private thinkExtractor = new IncrementalThinkExtractor();
   private reasoningOpen = false;
+  private reasoningBuf = "";
 
   constructor(
     onProgress?: ProgressCallback | null,
@@ -101,6 +102,7 @@ export class AgentProgressHook extends AgentHook {
   }
 
   override async beforeIteration(context: AgentHookContext): Promise<void> {
+    this.reasoningBuf = "";
     if (this.onIteration) this.onIteration(context.iteration ?? 0);
   }
 
@@ -117,11 +119,46 @@ export class AgentProgressHook extends AgentHook {
       await invokeOnProgress(this.onProgressCb, hint, { toolHint: true, toolEvents });
     }
     if (this.setToolContext) {
-      this.setToolContext(this.channel, this.chatId, this.messageId, this.metadata, this.sessionKey);
+      const response = (context as any).response;
+      const [responseReasoning] = extractReasoning(
+        typeof response?.reasoningContent === "string" ? response.reasoningContent : null,
+        Array.isArray(response?.thinkingBlocks) ? response.thinkingBlocks : null,
+        typeof response?.content === "string" ? response.content : null,
+      );
+      const responseReasoningSummary = typeof response?.reasoningSummary === "string"
+        && response.reasoningSummary.trim() ? response.reasoningSummary.trim() : null;
+      const responseThinkingBefore = typeof response?.thinkingBefore === "string"
+        && response.thinkingBefore.trim() ? response.thinkingBefore.trim() : null;
+      const responseReasoningField = typeof response?.reasoning === "string"
+        && response.reasoning.trim() ? response.reasoning.trim() : null;
+      const reasoning = this.reasoningBuf.trim()
+        || responseReasoning?.trim()
+        || responseReasoningSummary
+        || responseThinkingBefore
+        || responseReasoningField
+        || "";
+      const reasoningSummary = responseReasoningSummary ?? reasoning;
+      const thinkingBefore = responseThinkingBefore ?? reasoning;
+      const metadata = reasoning
+        ? {
+            ...this.metadata,
+            computerUseReasoning: reasoning,
+            computerUseReasoningSummary: reasoningSummary,
+            computerUseThinkingBefore: thinkingBefore,
+            computerUseReasoningIteration: context.iteration ?? null,
+          }
+        : this.metadata;
+      this.setToolContext(this.channel, this.chatId, this.messageId, metadata, this.sessionKey);
     }
   }
 
   override async emitReasoning(reasoningContent?: string | null): Promise<void> {
+    if (reasoningContent) {
+      const next = String(reasoningContent);
+      if (next && !this.reasoningBuf.endsWith(next)) {
+        this.reasoningBuf = next.startsWith(this.reasoningBuf) ? next : `${this.reasoningBuf}${next}`;
+      }
+    }
     if (this.onProgressCb && reasoningContent && onProgressAcceptsReasoning(this.onProgressCb)) {
       this.reasoningOpen = true;
       await this.onProgressCb(reasoningContent, { reasoning: true });

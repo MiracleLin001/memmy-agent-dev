@@ -23,6 +23,8 @@ let root: Root;
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.client = null;
+  Object.defineProperty(window, "localStorage", { configurable: true, value: createMemoryStorage() });
+  Object.defineProperty(window, "sessionStorage", { configurable: true, value: createMemoryStorage() });
   window.localStorage.clear();
   window.sessionStorage.clear();
   window.history.replaceState(null, "", "/memory");
@@ -30,6 +32,21 @@ beforeEach(() => {
   document.body.append(host);
   root = createRoot(host);
 });
+
+function createMemoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => Array.from(values.keys())[index] ?? null,
+    removeItem: (key) => values.delete(key),
+    setItem: (key, value) => values.set(key, value),
+  };
+}
+
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
@@ -125,9 +142,10 @@ describe("Computer History platform availability", () => {
     expect(entry).toBeDefined();
     expect([...host.querySelectorAll("nav button")].some((button) => button.textContent === "Computer History")).toBe(false);
     await act(async () => entry!.click());
-    expect(listCuHistoryEvents).not.toHaveBeenCalled();
-    await act(async () => host.querySelector<HTMLButtonElement>(".ch-raw__toggle")!.click());
     expect(listCuHistoryEvents).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain("Complete stitched history");
+    await act(async () => host.querySelector<HTMLButtonElement>(".ch-raw__toggle")!.click());
+    expect(listCuHistoryEvents).toHaveBeenCalledTimes(2);
     expect(events.every((event) => host.textContent?.includes(event.title))).toBe(true);
 
     const select = async (title: string) => {
